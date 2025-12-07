@@ -6,49 +6,42 @@ import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.data import DataLoader
 
-# ====================================================================
-# 导入模型和工具
-# ====================================================================
-
-# Swin-Unet 相关的导入 
-from networks.vision_transformer import SwinUnet as ViT_seg
 from config import get_config
+# Swin-Unet with contrastive/IIC heads
+from networks.vision_transformer import SwinUnetWithHeads as ViT_seg
+# Optional baseline UNet
+from networks.unet_model import UNet
 
-# UNet 相关的导入 (确保 unet_model.py 文件存在)
-from networks.unet_model import UNet 
-
-# 训练器和数据集导入 (根据您的实际文件名)
 import trainer_geometric
-from zarr_data import CustomSwinUnetGeometricDataset # 导入 Zarr 数据集类
+from zarr_data import CustomSwinUnetGeometricDataset
+import zarr_data  # to adjust module-level aug/flow switches
 
 import multiprocessing
-# 强制使用 spawn 启动方法，解决 PyTorch DataLoader 在 Windows 上的兼容性问题
+
+# Force spawn to avoid PyTorch DataLoader issues on Windows
 try:
     if multiprocessing.get_start_method() != 'spawn':
         multiprocessing.set_start_method('spawn', force=True)
 except RuntimeError:
     pass
 
-# ====================================================================
-# 参数定义
-# ====================================================================
-
+# ---------------------------------------------------------------
+# Argument definitions
+# ---------------------------------------------------------------
 parser = argparse.ArgumentParser()
-# --- Zarr 数据集路径 ---
+# Dataset
 parser.add_argument('--zarr_path', type=str,
-                     default=r'D:\ultrasonic\数据集\小范围_单人.zarr', 
-                     help='Path to the Zarr dataset file')
-# --- 模型选择参数 ---
-parser.add_argument(
-    '--model_type', type=str, default='swinunet', 
-    choices=['swinunet', 'unet'], 
-    help='选择要使用的模型类型: swinunet (默认) 或 unet'
-) 
-# --- 其他通用参数  ---
+                    default=r'D:\ultrasonic\数据集\小范围_单人.zarr',
+                    help='Path to the Zarr dataset file')
+# Model choice
+parser.add_argument('--model_type', type=str, default='swinunet',
+                    choices=['swinunet', 'unet'],
+                    help='Model type to use: swinunet (default) or unet')
+# Common training args
 parser.add_argument('--root_path', type=str, default='../data/Synapse/train_npz', help='root dir for data')
 parser.add_argument('--dataset', type=str, default='GeometricConsistency', help='experiment_name')
 parser.add_argument('--list_dir', type=str, default='./lists/lists_Synapse', help='list dir')
-parser.add_argument('--num_classes', type=int, default=128, help='output channel of network (Feature Dimension for Self-Supervision)')
+parser.add_argument('--num_classes', type=int, default=128, help='output channel of network (legacy, used by UNet)')
 parser.add_argument('--output_dir', type=str, default='./model_out/default', help='output dir')
 parser.add_argument('--max_iterations', type=int, default=30000, help='maximum epoch number to train')
 parser.add_argument('--max_epochs', type=int, default=150, help='maximum epoch number to train')
@@ -69,57 +62,61 @@ parser.add_argument('--amp-opt-level', type=str, default='O1', choices=['O0', 'O
 parser.add_argument('--tag', help='tag of experiment')
 parser.add_argument('--eval', action='store_true', help='Perform evaluation only')
 parser.add_argument('--throughput', action='store_true', help='Test throughput only')
-parser.add_argument("--n_class", default=128, type=int) 
-parser.add_argument("--num_workers", default=0, type=int) # 保持 0，解决内存溢出问题
+parser.add_argument("--n_class", default=128, type=int)
+parser.add_argument("--num_workers", default=0, type=int)  # keep 0 to avoid OOM on Windows
 parser.add_argument("--eval_interval", default=1, type=int)
+# Self-supervised / contrastive / IIC args
+parser.add_argument("--lambda_contrast", type=float, default=1.0, help="weight for contrastive loss")
+parser.add_argument("--lambda_iic", type=float, default=0.5, help="weight for IIC loss")
+parser.add_argument("--feat_dim", type=int, default=128, help="projection head output dim for contrastive")
+parser.add_argument("--num_clusters", type=int, default=16, help="cluster head output dim (IIC categories)")
+parser.add_argument("--lookahead_k", type=int, default=1, help="t+k frame distance")
+parser.add_argument("--enable_flow", action='store_true', help="use optical flow to warp features")
+parser.add_argument("--max_rotate", type=float, default=360.0, help="max rotation degree for strong aug")
+parser.add_argument("--noise_std", type=float, default=0.1, help="gaussian noise std for strong aug")
 
 
-# ====================================================================
-# 模型初始化函数 
-# ====================================================================
+# ---------------------------------------------------------------
+# Model initialization
+# ---------------------------------------------------------------
 def initialize_model(args, config=None):
-    """根据 args.model_type 初始化模型"""
+    """Initialize model according to args.model_type."""
     if args.model_type.lower() == 'unet':
-        # 传统 UNet 初始化
-        net = UNet(in_channels=1, 
-                   num_classes=args.num_classes
-                  ).cuda()
-        
+        net = UNet(in_channels=1, num_classes=args.num_classes).cuda()
         print(f"Loaded Traditional UNet. Output Features: {args.num_classes}")
         return net
-    
-    elif args.model_type.lower() == 'swinunet':
-        # Swin-Unet 初始化
+
+    if args.model_type.lower() == 'swinunet':
         if not config:
-             # 如果没有提供 config，尝试再次加载（防止外部调用时遗漏）
-             config = get_config(args) 
+            config = get_config(args)
 
-        # 初始化 Swin-Unet
-        net = ViT_seg(config, img_size=args.img_size, num_classes=args.num_classes).cuda()
+        net = ViT_seg(
+            config,
+            img_size=args.img_size,
+            feat_dim=args.feat_dim,
+            num_clusters=args.num_clusters
+        ).cuda()
 
-        # 加载 Swin-Unet 预训练权重
         try:
-            print("---start load pretrained modle of swin encoder---")
-            net.load_from(config) 
-            print("---load pretrained modle successful---")
+            print("---start load pretrained model of swin encoder---")
+            net.backbone.load_from(config)
+            print("---load pretrained model successful---")
         except Exception as e:
-            print(f"Swin-Unet 预训练权重加载失败或已跳过: {e}. 将从头开始训练。")
-        
-        print(f"Loaded Swin-Unet. Output Features: {args.num_classes}")
-        return net
-    
-    else:
-        raise ValueError(f"不支持的模型类型: {args.model_type}")
+            print(f"Swin-Unet pretrained weight load failed/skip: {e}. Training from scratch.")
 
-# ====================================================================
-# 主程序入口
-# ====================================================================
+        print(f"Loaded Swin-UnetWithHeads. proj dim: {args.feat_dim}, clusters: {args.num_clusters}")
+        return net
+
+    raise ValueError(f"Unsupported model type: {args.model_type}")
+
+
+# ---------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------
 if __name__ == "__main__":
     args = parser.parse_args()
 
-    # ----------------------------------------------------
-    # 确定性设置
-    # ----------------------------------------------------
+    # Determinism
     if args.deterministic:
         cudnn.benchmark = False
         cudnn.deterministic = True
@@ -131,31 +128,30 @@ if __name__ == "__main__":
         cudnn.benchmark = True
         cudnn.deterministic = False
 
-    # ----------------------------------------------------
-    # 模型和配置加载
-    # ----------------------------------------------------
+    # Load config if using swinunet
     config = None
     if args.model_type.lower() == 'swinunet':
-        # 仅在 Swin-Unet 模式下加载配置
         config = get_config(args)
-    
-    # ⚠️ 关键修改：调用统一的模型初始化函数
+
+    # Initialize model
     net = initialize_model(args, config)
-    
+
     if not os.path.exists(args.output_dir):
         os.makedirs(args.output_dir)
 
-    # ----------------------------------------------------
-    # 数据加载 (Zarr)
-    # ----------------------------------------------------
-    # 注意：Zarr 数据加载由 CustomSwinUnetGeometricDataset 处理
-    db_train = CustomSwinUnetGeometricDataset(zarr_path=args.zarr_path, 
-                                              lookahead_k=1, # 假设 Lookahead K=1
-                                              transform=None)
-    
+    # Set augmentation/flow knobs in dataset module
+    zarr_data.MAX_ROTATE_DEG = args.max_rotate
+    zarr_data.NOISE_STD = args.noise_std
+    zarr_data.ENABLE_FLOW = args.enable_flow
+
+    # Dataset & loader
+    db_train = CustomSwinUnetGeometricDataset(
+        zarr_path=args.zarr_path,
+        lookahead_k=args.lookahead_k,
+        transform=None
+    )
     print(f"The length of train set (valid pairs) is: {len(db_train)}")
-    
-    # 计算最大迭代次数
+
     num_train_pairs = len(db_train)
     if args.batch_size > 0:
         num_iterations_per_epoch = num_train_pairs // args.batch_size
@@ -165,16 +161,16 @@ if __name__ == "__main__":
         print("Batch size is zero or not positive, training loop will exit immediately.")
         exit()
 
-    # ⚠️ DataLoader：必须保持 num_workers=0 (低内存环境)
-    train_loader = DataLoader(db_train, batch_size=args.batch_size, shuffle=True, 
-                              num_workers=args.num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        db_train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
 
-    # ----------------------------------------------------
-    # 训练入口
-    # ----------------------------------------------------
-    
-    # 调用训练器函数
+    # Training entry
     trainer_geometric.trainer_geometric_consistency(args, net, args.output_dir, train_loader)
 
-# 示例运行命令（使用特征维度 8）
-# python train_new.py --output_dir ./model_out/geometric --dataset GeometricConsistency --img_size 224 --batch_size 16 --cfg configs/swin_tiny_patch4_window7_224_lite.yaml --num_classes 8 --zarr_path 'D:\ultrasonic\数据集\小范围_单人.zarr' --num_workers 0
+# 示例运行命令（特征维度128，聚类16）:
+# python train_new.py --output_dir ./model_out/geometric --dataset GeometricConsistency --img_size 224 --batch_size 2 --cfg configs/swin_tiny_patch4_window7_224_lite.yaml --num_clusters 16 --feat_dim 128 --zarr_path "D:\ultrasonic\数据集\小范围_单人.zarr" --num_workers 0 --enable_flow --lambda_contrast 1.0 --lambda_iic 0.5 --max_epochs 1

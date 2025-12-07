@@ -1,98 +1,148 @@
 import torch
 import torch.nn.functional as F
-from scipy.spatial.transform import Rotation as R
-import numpy as np
 
-# ⚠️ 注意: 这里的实现是复杂且高度依赖您的数据的。
-
-# 假设您的相机内参 (Intrinsics) 是全局已知的 Tensor 或参数
-# 示例内参 (需要您用实际值替换)
-# [fx, 0, cx]
-# [0, fy, cy]
-# [0, 0, 1]
-CAMERA_INTRINSICS = torch.tensor([
-    [500.0, 0.0, 306.0],
-    [0.0, 500.0, 306.0],
-    [0.0, 0.0, 1.0]
-], dtype=torch.float32)
+__all__ = [
+    "quat_pos_to_matrix",
+    "calculate_relative_transform",
+    "affine_to_grid",
+    "flow_to_grid",
+    "project_feature_map",
+    "_invert_affine_2x3",
+    "pixel_affine_to_normalized",
+    "warp_v2_to_v1",
+]
 
 
 def quat_pos_to_matrix(pose_7d: torch.Tensor) -> torch.Tensor:
-    """
-    将 7D 位姿 (x, y, z, qx, qy, qz, qw) 转换为 4x4 齐次变换矩阵。
-    
-    Args:
-        pose_7d: [B, 7] 的 Tensor，包含 (position + quaternion)。
-        
-    Returns:
-        [B, 4, 4] 的齐次变换矩阵 M_t。
-    """
+    """(x,y,z,qx,qy,qz,qw) -> [B,4,4] homogeneous matrix."""
     B = pose_7d.shape[0]
     device = pose_7d.device
-    
-    # TODO: 1. 将四元数 (qx, qy, qz, qw) 转换为 3x3 旋转矩阵 R
-    # ⚠️ 必须使用 NumPy/SciPy 的四元数转换函数或 PyTorch Geometric/PyTorch3D 等几何库。
-    
-    # 占位符: 假设旋转矩阵 R_mat = [B, 3, 3]
-    R_mat = torch.eye(3, device=device).repeat(B, 1, 1) 
-    
-    # 2. 提取平移向量 t = (x, y, z)
-    t = pose_7d[:, :3].unsqueeze(-1) # [B, 3, 1]
-    
-    # 3. 构建 4x4 齐次矩阵 M
-    M = torch.zeros((B, 4, 4), device=device)
+    dtype = pose_7d.dtype
+
+    t = pose_7d[:, :3]
+    q = pose_7d[:, 3:]
+    q = q / q.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    qx, qy, qz, qw = q.unbind(dim=1)
+
+    R_mat = torch.stack([
+        1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw),     2 * (qx * qz + qy * qw),
+        2 * (qx * qy + qz * qw),     1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw),
+        2 * (qx * qz - qy * qw),     2 * (qy * qz + qx * qw),     1 - 2 * (qx * qx + qy * qy)
+    ], dim=1).view(B, 3, 3)
+
+    M = torch.zeros(B, 4, 4, device=device, dtype=dtype)
     M[:, :3, :3] = R_mat
-    M[:, :3, 3] = t.squeeze(-1)
+    M[:, :3, 3] = t
     M[:, 3, 3] = 1.0
     return M
 
 
 def calculate_relative_transform(pose_t: torch.Tensor, pose_tk: torch.Tensor) -> torch.Tensor:
-    """
-    计算 T_t 到 T_{t+k} 的相对变换矩阵 M_rel = M_{t+k} @ inv(M_t)。
-    """
-    # 1. 转换为 4x4 矩阵
+    """Relative transform M_rel = M_tk @ inv(M_t)."""
     M_t = quat_pos_to_matrix(pose_t)
     M_tk = quat_pos_to_matrix(pose_tk)
-    
-    # 2. 计算逆矩阵 M_t_inv (旋转矩阵的逆是转置)
-    M_t_inv = torch.inverse(M_t) # 或对于欧式变换使用更快的 M_t_inv = M_t.transpose(-1, -2) 
-    
-    # 3. 相对变换
-    M_rel = torch.bmm(M_tk, M_t_inv)
-    return M_rel
+    M_t_inv = torch.inverse(M_t)
+    return torch.bmm(M_tk, M_t_inv)
 
 
-def project_feature_map(S_t: torch.Tensor, M_rel: torch.Tensor) -> torch.Tensor:
+def affine_to_grid(affine_2x3: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """[B,2,3] or [2,3] (already normalized) -> grid [B,H,W,2] in [-1,1]."""
+    if affine_2x3.dim() == 2:
+        affine_2x3 = affine_2x3.unsqueeze(0)
+    B = affine_2x3.size(0)
+    return F.affine_grid(affine_2x3, [B, 1, H, W], align_corners=True)
+
+
+def flow_to_grid(flow: torch.Tensor) -> torch.Tensor:
+    """flow: [B,H,W,2] or [H,W,2] (dx,dy in pixels) -> grid [B,H,W,2] in [-1,1]."""
+    if flow.dim() == 3:
+        flow = flow.unsqueeze(0)
+    B, H, W, _ = flow.shape
+    device = flow.device
+    yy, xx = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    xx = xx.float().unsqueeze(0).expand(B, -1, -1)
+    yy = yy.float().unsqueeze(0).expand(B, -1, -1)
+    x_new = xx + flow[..., 0]
+    y_new = yy + flow[..., 1]
+    x_norm = 2.0 * (x_new / max(W - 1, 1)) - 1.0
+    y_norm = 2.0 * (y_new / max(H - 1, 1)) - 1.0
+    return torch.stack([x_norm, y_norm], dim=-1)
+
+
+def pixel_affine_to_normalized(affine_2x3: torch.Tensor, H: int, W: int) -> torch.Tensor:
     """
-    将特征图 S_t 通过相对变换 M_rel (和相机内参) 投影到 I_{t+k} 的视图。
-    
-    Args:
-        S_t: [B, C, H, W] 的特征图。
-        M_rel: [B, 4, 4] 的相对变换矩阵。
-        
-    Returns:
-        [B, C, H, W] 的投影特征图 S'_tk。
+    Convert pixel-based affine (as from cv2.getRotationMatrix2D) to normalized theta for affine_grid (align_corners=True).
     """
-    B, C, H, W = S_t.shape
-    device = S_t.device
-    
-    # ⚠️ TODO: 核心几何投影逻辑 (Grid Sampler)
-    # 这部分涉及将 M_rel, 相机内参, 图像坐标系进行结合，生成一个用于 grid_sample 的采样网格。
-    
-    # 占位符: 如果没有实现投影，返回 S_t 的克隆
-    if M_rel.shape[1] != 4:
-         print("Warning: Geometric projection not fully implemented. Returning clone.")
-         return S_t.clone()
+    if affine_2x3.dim() == 2:
+        affine_2x3 = affine_2x3.unsqueeze(0)
+    sx = (W - 1) / 2.0
+    sy = (H - 1) / 2.0
+    out = torch.zeros_like(affine_2x3)
+    out[:, 0, 0] = affine_2x3[:, 0, 0]
+    out[:, 0, 1] = affine_2x3[:, 0, 1] * (sy / sx)
+    out[:, 0, 2] = affine_2x3[:, 0, 0] + affine_2x3[:, 0, 1] * (sy / sx) + affine_2x3[:, 0, 2] / sx - 1.0
+    out[:, 1, 0] = affine_2x3[:, 1, 0] * (sx / sy)
+    out[:, 1, 1] = affine_2x3[:, 1, 1]
+    out[:, 1, 2] = affine_2x3[:, 1, 0] * (sx / sy) + affine_2x3[:, 1, 1] + affine_2x3[:, 1, 2] / sy - 1.0
+    return out
 
-    # 假设我们已经通过几何计算得到了一个 [B, H, W, 2] 的归一化采样网格 (Grid)
-    # 这里的 grid 生成是难度最大的部分，需要根据实际相机模型和位姿计算
-    # grid = generate_sampling_grid(M_rel, H, W, K=CAMERA_INTRINSICS.to(device))
-    
-    # 占位符 Grid (返回一个无变换的 Grid)
-    grid = F.affine_grid(torch.eye(2, 3).unsqueeze(0).repeat(B, 1, 1).to(device), [B, C, H, W], align_corners=True)
-    
-    # F.grid_sample(input, grid) 进行采样
-    S_prime_tk = F.grid_sample(S_t, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
-    
-    return S_prime_tk
+
+def project_feature_map(S: torch.Tensor,
+                        flow: torch.Tensor = None,
+                        affine: torch.Tensor = None,
+                        M_rel: torch.Tensor = None) -> torch.Tensor:
+    """Warp features by flow or affine; M_rel placeholder."""
+    B, C, H, W = S.shape
+    if flow is not None:
+        grid = flow_to_grid(flow.to(S.device))
+        return F.grid_sample(S, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    if affine is not None:
+        theta = pixel_affine_to_normalized(affine.to(S.device), H, W)
+        grid = affine_to_grid(theta, H, W)
+        return F.grid_sample(S, grid, mode='bilinear', padding_mode='zeros', align_corners=True)
+    if M_rel is not None:
+        return S.clone()
+    return S.clone()
+
+
+def _invert_affine_2x3(affine_2x3: torch.Tensor) -> torch.Tensor:
+    """Invert 2x3 affine (batch aware)."""
+    if affine_2x3.dim() == 2:
+        affine_2x3 = affine_2x3.unsqueeze(0)
+    B = affine_2x3.size(0)
+    device = affine_2x3.device
+    inv_list = []
+    for i in range(B):
+        A = affine_2x3[i]
+        A3 = torch.eye(3, device=device, dtype=A.dtype)
+        A3[:2, :] = A
+        A3_inv = torch.inverse(A3)
+        inv_list.append(A3_inv[:2, :])
+    return torch.stack(inv_list, dim=0)
+
+
+def warp_v2_to_v1(feat_v2: torch.Tensor,
+                  affine_v2_inv: torch.Tensor,
+                  flow: torch.Tensor,
+                  affine_v1_inv: torch.Tensor) -> torch.Tensor:
+    """
+    Chain warp: remove view2 aug (view->orig) -> flow t+k->t -> apply view1 aug (orig->view1).
+    """
+    B, C, H, W = feat_v2.shape
+    device = feat_v2.device
+    # remove view2 aug: need forward matrix
+    affine_v2 = _invert_affine_2x3(affine_v2_inv)
+    theta_v2 = pixel_affine_to_normalized(affine_v2, H, W)
+    grid_unaug = affine_to_grid(theta_v2.to(device), H, W)
+    feat_tk_orig = F.grid_sample(feat_v2, grid_unaug, mode='bilinear', padding_mode='zeros', align_corners=True)
+
+    # flow warp t+k -> t
+    grid_flow = flow_to_grid(flow.to(device))
+    feat_t_orig = F.grid_sample(feat_tk_orig, grid_flow, mode='bilinear', padding_mode='zeros', align_corners=True)
+
+    # apply view1 aug: need forward matrix
+    affine_v1 = _invert_affine_2x3(affine_v1_inv)
+    theta_v1 = pixel_affine_to_normalized(affine_v1, H, W)
+    grid_v1 = affine_to_grid(theta_v1.to(device), H, W)
+    feat_v1 = F.grid_sample(feat_t_orig, grid_v1, mode='bilinear', padding_mode='zeros', align_corners=True)
+    return feat_v1
