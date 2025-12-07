@@ -11,6 +11,7 @@ from os.path import join as pjoin
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 from torch.nn import CrossEntropyLoss, Dropout, Softmax, Linear, Conv2d, LayerNorm
@@ -86,4 +87,37 @@ class SwinUnet(nn.Module):
             # print(msg)
         else:
             print("none pretrain")
- 
+
+
+class SwinUnetWithHeads(nn.Module):
+    """
+    Wrapper on top of SwinUnet that adds:
+      - proj_head: projection for pixel-level contrastive learning (SimSiam/BYOL style)
+      - cluster_head: classifier head for IIC mutual information maximization
+    forward returns (feat, proj_norm, prob)
+    """
+
+    def __init__(self, config, img_size=224, feat_dim=128, num_clusters=16, zero_head=False, vis=False):
+        super().__init__()
+        # reuse underlying SwinUnet
+        self.backbone = SwinUnet(config, img_size=img_size, num_classes=config.MODEL.NUM_CLASSES if hasattr(config.MODEL, "NUM_CLASSES") else config.MODEL.SWIN.NUM_CLASSES, zero_head=zero_head, vis=vis)
+
+        # the backbone output channel = num_classes passed into backbone
+        # If config has MODEL.NUM_CLASSES use it; otherwise fallback to backbone.num_classes
+        embed_dim = self.backbone.num_classes
+
+        self.proj_head = nn.Sequential(
+            nn.Conv2d(embed_dim, 256, kernel_size=1, bias=False),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, feat_dim, kernel_size=1, bias=True),
+        )
+        self.cluster_head = nn.Conv2d(embed_dim, num_clusters, kernel_size=1, bias=True)
+
+    def forward(self, x):
+        feat = self.backbone(x)  # [B, C, H, W]
+        proj = self.proj_head(feat)
+        proj = F.normalize(proj, dim=1)
+        logits = self.cluster_head(feat)
+        prob = F.softmax(logits, dim=1)
+        return feat, proj, prob
